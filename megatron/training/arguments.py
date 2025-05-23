@@ -2455,4 +2455,8 @@ def _add_experimental_args(parser):
                        help='Dtype of exp_avg when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    group.add_argument('--expert-dist-log-path', type=str, default=None,
+                       help='Path to save the expert distribution logs.')
+    group.add_argument('--num-dbep-experts', type=int, default=0, help='Number of DBEP experts.')
+    group.add_argument('--dbep-multiplier', type=int, default=None, help='DBEP multiplier.')
     return parser

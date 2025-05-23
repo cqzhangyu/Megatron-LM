@@ -6,6 +6,7 @@ from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
 from typing import Optional, Tuple
+import re
 
 import torch
 import torch.nn.functional as F
@@ -667,6 +668,15 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+        
+        for name, param in self.named_parameters():
+            # if name ends with "weight{i}"
+            # if torch.distributed.get_rank() == 0:
+            #     print(f"Found named_parameter: {name}")
+            match = re.search(r'weight(\d+)$', name)
+            if match:
+                local_expert_id = int(match.group(1))
+                setattr(param, 'local_expert_id', local_expert_id)
 
     def forward(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor

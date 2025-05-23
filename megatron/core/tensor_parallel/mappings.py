@@ -111,7 +111,7 @@ def _reduce_scatter_along_last_dim(input_):
     return output
 
 
-def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_global_buffer=False):
+def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_global_buffer=False, async_op=False, async_event=[None]):
     """Gather tensors and concatenate along the first dimension.
 
     Args:
@@ -140,7 +140,7 @@ def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_glo
             output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        dist_all_gather_func(output, input_.contiguous(), group=group)
+        async_event[0] = dist_all_gather_func(output, input_.contiguous(), group=group, async_op=async_op)
     else:
         dim_size[0] = sum(output_split_sizes)
         if use_global_buffer:
@@ -148,7 +148,7 @@ def _gather_along_first_dim(input_, group=None, output_split_sizes=None, use_glo
         else:
             output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
         output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
-        torch.distributed.all_gather(output_tensor_list, input_, group=group)
+        async_event[0] = torch.distributed.all_gather(output_tensor_list, input_, group=group, async_op=async_op)
 
     return output
 
@@ -304,9 +304,11 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         group=None,
         output_split_sizes=None,
         use_global_buffer=False,
+        async_op=False,
+        async_event=[None],
     ):
         """Symbolic function for tracing."""
-        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer)
+        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer, async_op, async_event)
 
     @staticmethod
     def forward(
@@ -316,13 +318,15 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
         group=None,
         output_split_sizes=None,
         use_global_buffer=False,
+        async_op=False,
+        async_event=[None],
     ):
         """Forward function."""
         ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.use_global_buffer = use_global_buffer
-        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer)
+        return _gather_along_first_dim(input_, group, output_split_sizes, use_global_buffer, async_op, async_event)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -342,10 +346,11 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None, None,
             )
         else:
             assert ctx.output_split_sizes is None
-            return _split_along_first_dim(grad_output, ctx.group), None, None, None, None
+            return _split_along_first_dim(grad_output, ctx.group), None, None, None, None, None, None
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
@@ -417,7 +422,7 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, async_op, async_event):
         """Forward function."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
@@ -439,12 +444,14 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
+
+        async_event[0] = torch.distributed.all_to_all_single(
             output,
             input,
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
             group=group,
+            async_op=async_op,
         )
         return output
 
@@ -453,7 +460,9 @@ class _AllToAll(torch.autograd.Function):
         """Backward function."""
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes, False, [None]),
+            None,
+            None,
             None,
             None,
         )
@@ -495,10 +504,11 @@ def gather_from_sequence_parallel_region(
     group=None,
     output_split_sizes=None,
     use_global_buffer=False,
+    async_op=False, async_event=[None]
 ):
     """Wrapper for autograd function: forward: AG, backward: RS <first dim>"""
     return _GatherFromSequenceParallelRegion.apply(
-        input_, tensor_parallel_output_grad, group, output_split_sizes, use_global_buffer
+        input_, tensor_parallel_output_grad, group, output_split_sizes, use_global_buffer, async_op, async_event
     )
 
 
@@ -521,10 +531,9 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_):
     return _ReduceScatterToTensorParallelRegion.apply(input_)
 
 
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None, async_op=False, async_event=[None]):
     """Wrapper for autograd function"""
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
-
+    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, async_op, async_event)
 
 def all_to_all_sp2hp(input_):
     """

@@ -15,6 +15,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
 )
+from megatron.core.transformer.moe.dbep_token_dispatcher import MoEDBEPTokenDispatcher
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -68,6 +69,7 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        self.token_dispatcher.set_layer_number(layer_number)
 
 
 class MoELayer(BaseMoELayer):
@@ -83,12 +85,21 @@ class MoELayer(BaseMoELayer):
         self.submodules = submodules
         super(MoELayer, self).__init__(config=config, layer_number=layer_number)
         self.moe_layer_recompute = config.moe_layer_recompute
+        self.use_dbep = not (config.dbep_multiplier is None)
+        self.dispatch_time = None
+        self.combine_time = None
+        self.expert_computation_time = None
+        self.rank = torch.distributed.get_rank()
 
         # Initialize router
         self.router = TopKRouter(config=self.config)
 
         # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "allgather":
+        if self.use_dbep:
+            self.token_dispatcher = MoEDBEPTokenDispatcher(
+                self.num_local_experts, config=self.config
+            )
+        elif config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.num_local_experts, self.local_expert_indices, config=self.config
             )
@@ -119,6 +130,8 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
     def forward(self, hidden_states: torch.Tensor):
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         if (
             self.training
             and self.config.tensor_model_parallel_size > 1
@@ -131,16 +144,36 @@ class MoELayer(BaseMoELayer):
 
         # process MoE
         def custom_forward(hidden_states):
+            time_1 = torch.cuda.Event(enable_timing=True)
+            time_2 = torch.cuda.Event(enable_timing=True)
+            time_3 = torch.cuda.Event(enable_timing=True)
+            time_4 = torch.cuda.Event(enable_timing=True)
             probs, routing_map = self.router(hidden_states)
+            self.token_dispatcher.set_training(self.training)
+            time_1.record()
             (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
                 hidden_states, probs, routing_map
             )
+            time_2.record()
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+            time_3.record()
+
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+            time_4.record()
             if self.use_shared_expert and not self.shared_expert_overlap:
                 # if shared_expert_overlap is True, the expert calculation happens in
                 # the token_dispatcher to overlap communications and computations
                 output = output + self.shared_experts(hidden_states)
+            
+            torch.cuda.synchronize()
+            self.dispatch_time = time_1.elapsed_time(time_2)
+            self.expert_computation_time = time_2.elapsed_time(time_3)
+            self.combine_time = time_3.elapsed_time(time_4)
+            # print(f"rank {self.rank} "
+            #       f"layer {self.layer_number} "
+            #       f"dispatch time: {self.dispatch_time} ms, "
+            #       f"expert computation time: {self.expert_computation_time} ms, "
+            #       f"combine time: {self.combine_time} ms")
             return output, mlp_bias
 
         if self.moe_layer_recompute:

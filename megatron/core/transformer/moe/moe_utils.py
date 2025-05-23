@@ -370,6 +370,12 @@ def sort_chunks_by_idxs(
     output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
     return output
 
+def sort_chunks_by_idxs_custom(
+    input: torch.Tensor, split_sizes: list, sorted_idxs: list
+):
+    input = torch.split(input, split_sizes, dim=0)
+    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
+    return output
 
 def group_limited_topk(
     scores: torch.Tensor,

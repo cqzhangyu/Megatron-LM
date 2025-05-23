@@ -54,6 +54,21 @@ _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
 _MPU_EXPERT_TENSOR_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_TENSOR_PARALLEL_RANK = None
+
+# DBEP states
+# gpu info
+_DBEP_GROUP = None
+_DBEP_GROUP_GLOO = None
+_DBEP_GROUP_ID = None
+_DBEP_RANK = None
+_DBEP_WORLD_SIZE = None
+_DBEP_INSTANCES = None
+_DBEP_TIMEOUT = None
+_DBEP_NCCL_CONFIGS = None
+_DBEP_ALL_GROUPS = None
+# (layer, dbep_expert_id)
+_DBEP_DP_GROUPS = None
+
 ### End of expert related parallel states
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
@@ -441,6 +456,7 @@ def initialize_model_parallel(
     expert_model_parallel_size: int = 1,
     num_distributed_optimizer_instances: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
+    dbep_multiplier: Optional[int] = None,
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
@@ -789,6 +805,7 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
+            print(f"Data parallel group: {ranks}")
 
     assert (
         data_parallel_size * context_parallel_size
@@ -1117,6 +1134,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
+            print(f"Expert model parallel group {ranks}")
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1185,6 +1203,53 @@ def initialize_model_parallel(
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
+            print(f"Expert data parallel group {ranks}")
+    
+    if dbep_multiplier is not None:
+        assert dbep_multiplier > 1
+        dbep_size = expert_model_parallel_size * dbep_multiplier
+        if decoder_world_size % dbep_size != 0:
+            raise RuntimeError(
+                f"decoder world_size ({decoder_world_size}) is not divisible by dbep_size ({dbep_size})"
+            )
+        dbep_rank_generator = RankGenerator(
+            tp=expert_tensor_parallel_size,
+            ep=dbep_size,
+            dp=decoder_world_size // dbep_size // pipeline_model_parallel_size,
+            pp=pipeline_model_parallel_size,
+            cp=1,
+            order=order,
+            rank_offset=encoder_world_size,
+        )
+
+        global _DBEP_GROUP
+        global _DBEP_GROUP_GLOO
+        global _DBEP_GROUP_ID
+        global _DBEP_WORLD_SIZE
+        global _DBEP_TIMEOUT
+        global _DBEP_NCCL_CONFIGS
+        _DBEP_WORLD_SIZE = dbep_size
+        _DBEP_TIMEOUT = timeout
+        _DBEP_NCCL_CONFIGS = nccl_comm_cfgs
+
+        group_id = 0
+        for ranks in dbep_rank_generator.get_ranks('ep'):
+            group = create_group(
+                ranks,
+                timeout=_DBEP_TIMEOUT,
+                pg_options=get_nccl_options('dbep', nccl_comm_cfgs),
+                group_desc='DBEP_GROUP',
+            )
+            group_gloo = create_group(
+                ranks, backend="gloo", group_desc='DBEP_GROUP_GLOO'
+            )
+            if rank in ranks:
+                _DBEP_GROUP = group
+                _DBEP_GROUP_GLOO = group_gloo
+                _DBEP_GROUP_ID = group_id
+                print(f"DBEP group {ranks}")
+            group_id += 1
+
     ### End of expert related parallel groups initialization
 
     # Initialize global memory buffer
@@ -2102,3 +2167,69 @@ def destroy_model_parallel():
 
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     _MOE_LAYER_WISE_LOGGING_TRACKER = {}
+
+def set_dbep_instances(dbep_instances: dict):
+    global _DBEP_INSTANCES
+    _DBEP_INSTANCES = dbep_instances
+
+def get_dbep_instance_for_layer(layer: int):
+    global _DBEP_INSTANCES
+    return _DBEP_INSTANCES[layer]
+
+def get_dbep_instances():
+    global _DBEP_INSTANCES
+    return _DBEP_INSTANCES
+
+def get_dbep_group():
+    global _DBEP_GROUP
+    return _DBEP_GROUP
+
+def get_dbep_group_gloo():
+    global _DBEP_GROUP_GLOO
+    return _DBEP_GROUP_GLOO
+
+def get_dbep_rank():
+    global _DBEP_RANK
+    if _DBEP_RANK is None:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            _DBEP_RANK = torch.distributed.get_rank(group=get_dbep_group())
+    return _DBEP_RANK
+
+def get_dbep_world_size():
+    global _DBEP_WORLD_SIZE
+    return _DBEP_WORLD_SIZE
+
+def get_dbep_group_id():
+    global _DBEP_GROUP_ID
+    return _DBEP_GROUP_ID
+
+def create_dbep_dp_groups(dbep_expert_dp_ranks: dict):
+    global _DBEP_TIMEOUT
+    global _DBEP_NCCL_CONFIGS
+    global _DBEP_ALL_GROUPS
+    global _DBEP_DP_GROUPS
+
+    _DBEP_ALL_GROUPS = {}
+    _DBEP_DP_GROUPS = {}
+    num_groups = 0
+    for (layer, expert), ranks in sorted(dbep_expert_dp_ranks.items(), key=lambda x: x[0]):
+        global_ranks = [_DATA_PARALLEL_GLOBAL_RANKS[rank] for rank in ranks]
+        # sort and make unique ranks
+        ranks_tuple = tuple(sorted(list(set(global_ranks))))
+        dbep_expert_dp_ranks[(layer, expert)] = ranks_tuple
+        group = _DBEP_ALL_GROUPS.get(ranks_tuple, None)
+        if group is None:
+            print(f"rank {torch.distributed.get_rank()} creating DBEP DP group {num_groups} for ranks {ranks_tuple}")
+            group = create_group(
+                global_ranks,
+                timeout=_DBEP_TIMEOUT,
+                pg_options=get_nccl_options('dbep-dp', _DBEP_NCCL_CONFIGS),
+                group_desc=f'DBEP_DP_GROUP_{num_groups}',
+            )
+            _DBEP_ALL_GROUPS[ranks_tuple] = group
+            num_groups += 1
+        _DBEP_DP_GROUPS[(layer, expert)] = group
+
+def get_dbep_dp_group_from_ranks(ranks : tuple):
+    global _DBEP_ALL_GROUPS
+    return _DBEP_ALL_GROUPS.get(ranks, None)

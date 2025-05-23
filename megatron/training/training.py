@@ -35,6 +35,7 @@ from megatron.training.checkpointing import checkpoint_exists
 from megatron.legacy.model import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed.cocktail import CocktailDataParallel
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -103,6 +104,21 @@ from . import one_logger_utils
 from . import ft_integration
 
 stimer = StragglerDetector()
+
+import threading
+import traceback
+def dump_threads_stacks():
+    pid = os.getpid()
+    # dump the stacktrace of all threads
+    print("Dumping stacktrace of all threads for pid %d" % pid)
+    with open(f'/workspace/userdata/logs/test/dbep/stacktrace-{pid}.log', 'w') as f:
+        for thread_id, stack in sys._current_frames().items():
+            f.write(f"Thread ID: {thread_id}\n")
+            for filename, lineno, name, line in traceback.extract_stack(stack):
+                f.write(f"  File: {filename}, line {lineno}, in {name}\n")
+                f.write(f"    {line.strip()}\n")
+            f.write("\n")
+            f.write("-" * 80 + "\n")
 
 
 def destroy_global_state():
@@ -593,6 +609,21 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+        
+    # Print the submodule names of all layers in the model.
+    if mpu.get_expert_model_parallel_rank() == 0:
+        for model_module in model:
+            # print(' > model layer names:', flush=True)
+            # for name, module in model_module.named_modules():
+            #     if module != model_module:
+            #         # print name and class name
+            #         print('    -', name, module.__class__.__name__, flush=True)
+            print(' > model layer names:', flush=True)
+            for name, param in model_module.named_parameters():
+                if not param.requires_grad:
+                    continue
+                # print name and class name
+                print('    -', name, param.data.shape, flush=True)
 
     # Print number of parameters.
     num_parameters = sum(
@@ -633,7 +664,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     fp8_meta.amax_history[0][fp8_meta_index] = 0
 
     if wrap_with_ddp:
-        if args.use_torch_fsdp2:
+        if args.num_dbep_experts > 0:
+            DP = CocktailDataParallel
+        elif args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
         elif args.use_custom_fsdp:
@@ -899,6 +932,9 @@ def train_step(forward_step_func, data_iterator,
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    
+    import threading
+    threading.Timer(110, dump_threads_stacks).start()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
@@ -1238,13 +1274,13 @@ def compute_throughputs_and_append_to_progress_log(iteration,
 
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        assert isinstance(model_chunk, (DDP, CocktailDataParallel))
         model_chunk.enable_forward_pre_hook()
 
 
 def disable_forward_pre_hook(model_chunks, param_sync=True):
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        assert isinstance(model_chunk, (DDP, CocktailDataParallel))
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
@@ -1455,7 +1491,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
-    if isinstance(model[0], (custom_FSDP, DDP)) and args.overlap_grad_reduce:
+    if isinstance(model[0], (custom_FSDP, DDP, CocktailDataParallel)) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, \
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
              'a custom no_sync_func is not supported when overlapping grad-reduce')
@@ -1533,8 +1569,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             active=args.profile_step_end-args.profile_step_start,
             repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-        record_shapes=True,
-        with_stack=True)
+        # record_shapes=True,
+        # with_stack=True)
+        record_shapes=False,
+        with_stack=False)
         prof.start()
 
     start_iteration = iteration
@@ -1567,6 +1605,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
+
+        # if on rank 0
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            if iteration == 0:
+                # create new file
+                with open(args.expert_dist_log_path + f"_{rank}.txt", 'w') as f:
+                    f.write(f'Number of iterations: {args.train_iters}\n')
+                    f.write(f'Number of experts: {args.num_experts}\n')
+                    f.write(f'Number of microbatches per iteration: {num_microbatches}\n')
+                    f.write(f'Number of samples per microbatch: {args.micro_batch_size * args.seq_length}\n')
+                    f.write(f'Number of transformer layers: {args.num_layers}\n')
+                    f.write(f'World size: {args.world_size}\n')
+
+            with open(args.expert_dist_log_path + f"_{rank}.txt", 'a') as f:
+                f.write(f'iteration {iteration}\n')
 
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different

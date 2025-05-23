@@ -258,7 +258,8 @@ def main():
 
     if args.split_sentences:
         if nltk_available:
-            nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
+            pass
+            # nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
         else:
             raise Exception(
                 "nltk library required for sentence splitting is not available.")

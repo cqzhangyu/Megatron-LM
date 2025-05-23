@@ -6,7 +6,9 @@ from typing import List, Optional, Tuple
 import torch
 
 from megatron.core.parallel_state import (
+    get_expert_data_parallel_rank,
     get_expert_model_parallel_group,
+    get_expert_model_parallel_rank,
     get_expert_tensor_and_model_parallel_group,
     get_expert_tensor_parallel_group,
     get_expert_tensor_parallel_rank,
@@ -105,7 +107,12 @@ class MoETokenDispatcher:
         """Set shared expert to the dispatcher."""
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
-
+    
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
+    
+    def set_training(self, training: bool):
+        self.training = training
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
@@ -342,6 +349,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.cuda_sync_point = "no_sync"
 
         self.shared_experts = None
+        self.ep_rank = get_expert_model_parallel_rank()
+        self.layer_number = None
+        self.expert_dist_log_path = config.expert_dist_log_path + f"_{torch.distributed.get_rank()}.txt"
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -422,6 +432,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
             num_global_tokens_per_expert = (
+                # CQ: this function is time consuming!
                 gather_from_sequence_parallel_region(
                     num_local_tokens_per_expert, group=self.tp_ep_group
                 )
@@ -454,6 +465,31 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1)).to(
                 torch.device("cpu"), non_blocking=True
             )
+            
+            if self.ep_rank == 0 and self.tp_rank == 0 and self.training:
+                # Calculate the number of tokens for each global expert.
+                # [num_experts]
+                num_global_tokens_per_global_expert = num_global_tokens_per_expert.sum(axis=(0, 1)).to(
+                    torch.device("cpu"), non_blocking=True
+                )
+            #     # [num_experts]
+            #     num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
+            #         torch.device("cpu"), non_blocking=True
+            #     )
+            #     # [tp_size, ep_size, num_local_experts] -> [tp_size * ep_size * num_local_experts]
+            #     # num_global_tokens_per_local_expert_cpu = num_global_tokens_per_local_expert.view(-1).contiguous().to(
+            #     #     torch.device("cpu"), non_blocking=True
+            #     # )
+
+                torch.cuda.current_stream().synchronize()
+                # Write expert distribution to a log file.
+                with open(self.expert_dist_log_path, "a") as f:
+                    # [num_experts]
+                    f.write(f"Layer {self.layer_number} num_global_tokens_per_global_expert : {num_global_tokens_per_global_expert.tolist()}\n")
+            #         # [num_experts]
+            #         f.write(f"Layer {self.layer_number} num_local_tokens_per_expert : {num_local_tokens_per_expert_cpu.tolist()}\n")
+            #         # [num_local_experts]
+            #         # f.write(f"Layer {self.layer_number} num_global_tokens_per_local_expert : {num_global_tokens_per_local_expert.tolist()}\n")
         else:
             num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
                 self.num_experts

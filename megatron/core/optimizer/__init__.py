@@ -93,6 +93,7 @@ def _get_param_groups(
                 continue
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            dbep_ranks = getattr(param, 'dbep_ranks', None)
 
             if no_weight_decay_cond is not None:
                 no_wd = no_weight_decay_cond(name, param)
@@ -122,13 +123,13 @@ def _get_param_groups(
             ):
                 is_decoupled_lr = True
 
-            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr, dbep_ranks)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
 
     param_groups = []
-    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
+    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr, dbep_ranks), params in params_map.items():
         assert len(params) > 0
         param_group = {
             'params': params,
@@ -136,6 +137,7 @@ def _get_param_groups(
             'lr_mult': _lr_mult,
             'is_expert_parallel': is_expert_parallel,
             'is_decoupled_lr': is_decoupled_lr,
+            'dbep_ranks': dbep_ranks,
         }
         param_groups.append(param_group)
 
@@ -402,6 +404,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 data_parallel_group_idx=data_parallel_group_idx,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
+            setattr(optimizer, 'grad_stats_parallel_group', data_parallel_group)
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
@@ -550,9 +553,21 @@ def get_megatron_optimizer(
         no_weight_decay_cond=no_weight_decay_cond,
         scale_lr_cond=scale_lr_cond,
         lr_mult=lr_mult,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_fn=lambda g: g['is_expert_parallel'] and not g['dbep_ranks'],
         buffer_name='expert_parallel_buffers',
     )
+    
+    dbep_param_groups, dbep_buffers = _get_param_groups_and_buffers(
+        model_chunks,
+        model_chunk_offset=0,
+        config=config,
+        no_weight_decay_cond=no_weight_decay_cond,
+        scale_lr_cond=scale_lr_cond,
+        lr_mult=lr_mult,
+        filter_fn=lambda g: g['dbep_ranks'],
+        buffer_name='dbep_buffers',
+    )
+
     if len(moe_param_groups) > 0:
         model_parallel_rank = torch.distributed.get_rank(
             mpu.get_expert_tensor_model_pipeline_parallel_group()
@@ -574,6 +589,28 @@ def get_megatron_optimizer(
                 data_parallel_group_idx=model_parallel_rank,
             )
         )
+
+    if len(dbep_param_groups) > 0:
+        model_parallel_rank = torch.distributed.get_rank(
+            mpu.get_expert_tensor_model_pipeline_parallel_group()
+        )
+        dbep_param_groups = sorted(dbep_param_groups, key=lambda x: x['dbep_ranks'])
+        for dbep_param_group, dbep_buffer in zip(dbep_param_groups, dbep_buffers[0]):
+            assert len(dbep_param_group['params']) > 0
+            per_model_buffers = {}
+            per_model_buffers[0] = dbep_buffer
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=model_chunks,
+                    param_groups=[dbep_param_group],
+                    per_model_buffers=per_model_buffers,
+                    model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
+                    data_parallel_group=mpu.get_dbep_dp_group_from_ranks(dbep_param_group['dbep_ranks']),
+                    data_parallel_group_gloo=None,
+                    data_parallel_group_idx=model_parallel_rank,
+                )
+            )
 
     if len(optimizers) == 1:
         return optimizers[0]

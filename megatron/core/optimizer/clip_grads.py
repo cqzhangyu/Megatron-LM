@@ -123,14 +123,26 @@ def get_grad_norm_fp32(
                 total_norm += grad_norm**norm_type
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
+        # print(f"rank {torch.distributed.get_rank()} start all-reduce total_norm among group {torch.distributed.get_process_group_ranks(data_parallel_group)}")
         if data_parallel_group:
+            print(f"rank {torch.distributed.get_rank()} start all-reduce total_norm for data_parallel_group {torch.distributed.get_process_group_ranks(data_parallel_group)}")
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             )
+            print(f"rank {torch.distributed.get_rank()} end all-reduce total_norm for data_parallel_group {torch.distributed.get_process_group_ranks(data_parallel_group)}")
+        if grad_stats_parallel_group:
+            print(f"rank {torch.distributed.get_rank()} start all-reduce total_norm for grad_stats_parallel_group {torch.distributed.get_process_group_ranks(grad_stats_parallel_group)}")
+        else:
+            print(f"rank {torch.distributed.get_rank()} start all-reduce total_norm for grad_stats_parallel_group None")
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
+        if grad_stats_parallel_group:
+            print(f"rank {torch.distributed.get_rank()} end all-reduce total_norm for grad_stats_parallel_group {torch.distributed.get_process_group_ranks(grad_stats_parallel_group)}")
+        else:
+            print(f"rank {torch.distributed.get_rank()} end all-reduce total_norm for grad_stats_parallel_group None")
         total_norm = total_norm.item() ** (1.0 / norm_type)
+        print(f"rank {torch.distributed.get_rank()} end compute total_norm")
 
     return total_norm
 

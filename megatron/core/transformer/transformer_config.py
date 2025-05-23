@@ -464,6 +464,15 @@ class TransformerConfig(ModelParallelConfig):
     use_custom_fsdp: bool = False
     """ Whether to use custom fsdp for training. """
 
+    expert_dist_log_path: Optional[str] = None
+    """ Path to save expert distribution log. """
+
+    num_dbep_experts: Optional[int] = None
+    """ Number of experts for DBEP. This is only used when using DBEP. """
+
+    dbep_multiplier: Optional[int] = None
+    """ DBEP size / expert parallel size. """
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
