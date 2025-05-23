@@ -3,6 +3,7 @@ import filecmp
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
@@ -76,7 +77,6 @@ class TestLocalCheckpointing:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
         rng_state = None
-        use_dist_ckpt = True
         iteration = None
         optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
         mock_args = parse_args(ignore_unknown_args=True)
@@ -90,7 +90,6 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt=use_dist_ckpt,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
@@ -129,7 +128,6 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt=True,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
@@ -236,6 +234,7 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
+            time.sleep(0.01)  # Allow sufficient time for async cleanup to complete
             assert not ckpt_path.exists()
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(2)
             ckpt_path = checkpointing_context['local_checkpoint_manager']._local_ckpt_path_from_id(

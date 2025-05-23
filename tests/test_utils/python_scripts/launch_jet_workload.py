@@ -12,6 +12,7 @@ from typing import List, Optional
 
 import click
 import jetclient
+import pandas as pd
 import requests
 import yaml
 from jetclient.facades.objects import log as jet_log
@@ -20,6 +21,11 @@ from jetclient.services.dtos.pipeline import PipelineStatus
 from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
+
+logging.basicConfig()
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +50,14 @@ def launch_and_wait_for_completion(
     container_image: Optional[str],
     container_tag: str,
     cluster: str,
+    platform: str,
     account: str,
     record_checkpoints: str,
     partition: Optional[str],
     tag: Optional[str],
     run_name: Optional[str],
     wandb_experiment: Optional[str],
+    enable_lightweight_mode: bool,
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
@@ -64,11 +72,12 @@ def launch_and_wait_for_completion(
                 workloads=common.load_workloads(
                     test_case=test_case,
                     n_repeat=n_repeat,
-                    time_limit=time_limit,
+                    time_limit=(1200 if enable_lightweight_mode else time_limit),
                     tag=tag,
                     scope=scope,
                     container_image=container_image,
                     container_tag=container_tag,
+                    platform=platform,
                     environment=environment,
                     record_checkpoints=record_checkpoints,
                 ),
@@ -81,12 +90,20 @@ def launch_and_wait_for_completion(
                                 cluster: {
                                     "variables": {
                                         "RUN_NAME": run_name or "",
+                                        "ENABLE_LIGHTWEIGHT_MODE": str(
+                                            enable_lightweight_mode
+                                        ).lower(),
                                         "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
                                         "WANDB_EXPERIMENT": wandb_experiment or "",
                                         "RECORD_CHECKPOINTS": str(
-                                            "Record checkpoints"
-                                            in os.getenv("CI_MERGE_REQUEST_LABELS", "")
+                                            record_checkpoints == "true"
                                         ).lower(),
+                                        "RO_API_TOKEN": os.getenv("RO_API_TOKEN") or "",
+                                        "MCORE_REPO": os.getenv("CI_REPOSITORY_URL") or "",
+                                        "MCORE_MR_COMMIT": os.getenv("MCORE_MR_COMMIT") or "",
+                                        "MCORE_BACKWARDS_COMMIT": (
+                                            os.getenv("MCORE_BACKWARDS_COMMIT") or ""
+                                        ),
                                     }
                                 }
                             }
@@ -111,6 +128,9 @@ def launch_and_wait_for_completion(
             logger.info("Submission failed, attempt again (%s/3)", str(n_submission_attempts))
             continue
         break
+
+    if n_submission_attempts == 3:
+        sys.exit(1)
 
     register_pipeline_terminator(pipeline=pipeline)
 
@@ -174,6 +194,45 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
     return False
 
 
+def telemetrics_and_exit(
+    success: bool, test_case: str, environment: str, pipeline_id: int, is_integration_test: bool
+):
+    payload = json.dumps(
+        [
+            {
+                "pipeline_id": pipeline_id,
+                "success": success,
+                "test_case": test_case,
+                "environment": environment,
+                "is_integration_test": is_integration_test,
+                "duration_seconds": (
+                    pd.Timestamp.now(tz='UTC')
+                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz='UTC')
+                ).total_seconds(),
+                "is_merge_request": os.getenv("CI_MERGE_REQUEST_IID") is not None,
+                "ci_merge_request_iid": os.getenv("CI_MERGE_REQUEST_IID"),
+            }
+        ]
+    )
+    logger.info(payload)
+
+    if DASHBOARD_ENDPOINT is None:
+        logger.info("No dashboard endpoint found, skipping telemetrics")
+        return
+
+    res = requests.post(
+        DASHBOARD_ENDPOINT,
+        data=payload,
+        headers={'Content-Type': 'application/json', 'Accept-Charset': 'UTF-8'},
+    )
+
+    if not res.ok:
+        raise requests.exceptions.HTTPError(
+            f"Failed to make POST request. Received response: {res.status_code}"
+        )
+    sys.exit(int(not success))
+
+
 @click.command()
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
@@ -192,6 +251,7 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
 )
 @click.option("--partition", required=False, type=str, help="Slurm partition to use", default=None)
 @click.option("--cluster", required=True, type=str, help="Cluster to run on")
+@click.option("--platform", required=True, type=str, help="Platform to select")
 @click.option("--container-tag", required=True, type=str, help="Base image of Mcore image")
 @click.option("--container-image", required=False, type=str, help="Base image of Mcore image")
 @click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
@@ -205,6 +265,15 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
     type=str,
     help="Wandb experiment (only relevant for release tests)",
 )
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Wandb experiment (only relevant for release tests)",
+)
 def main(
     model: str,
     test_case: str,
@@ -215,12 +284,14 @@ def main(
     account: str,
     partition: Optional[str],
     cluster: str,
+    platform: str,
     container_tag: str,
     record_checkpoints: str,
     tag: Optional[str] = None,
     container_image: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
+    enable_lightweight_mode: bool = False,
 ):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
@@ -266,12 +337,14 @@ def main(
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,
+            platform=platform,
             account=account,
             partition=partition,
             tag=tag,
             run_name=run_name,
             wandb_experiment=wandb_experiment,
             record_checkpoints=record_checkpoints,
+            enable_lightweight_mode=enable_lightweight_mode,
         )
 
         n_download_attempt = 0
@@ -311,18 +384,48 @@ def main(
         if test_type != "release":
             print(f"Logs:\n{concat_logs}")
 
-        success = pipeline.get_status() == PipelineStatus.SUCCESS
-        logger.info("Pipeline terminated with status %s", pipeline.get_status().name)
+        n_status_attempts = 0
+        status = None
+        while n_status_attempts < 3:
+            try:
+                status = pipeline.get_status()
+                break
+            except jetclient.clients.gitlab.GitlabAPIError:
+                logging.info("Could not fetch status, try again")
+                time.sleep(2 * n_status_attempts * 15)
+                n_status_attempts += 1
+
+        if status is None:
+            continue
+
+        success = status == PipelineStatus.SUCCESS
+        logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
+            if (
+                "The server socket has failed to listen on any local network address."
+                in concat_logs
+            ):
+                logger.error("TCP error, attempt restart.")
+                n_attempts += 1
+                continue
+
             sys.exit(int(not success))  # invert for exit 0
 
         if test_type != "release":
             if success:
-                sys.exit(int(not success))  # invert for exit 0
+                telemetrics_and_exit(
+                    success=True,
+                    test_case=test_case,
+                    environment=environment,
+                    pipeline_id=int(os.getenv("PARENT_PIPELINE_ID", 0)),
+                    is_integration_test=enable_lightweight_mode,
+                )
 
             if (
-                "Some NCCL operations have failed or timed out." in concat_logs
+                "The server socket has failed to listen on any local network address."
+                in concat_logs
+                or "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
                 or "illegal instruction" in concat_logs
@@ -337,7 +440,13 @@ def main(
                 n_nondeterminism_attemps += 1
                 continue
 
-            sys.exit(1)
+            telemetrics_and_exit(
+                success=False,
+                test_case=test_case,
+                environment=environment,
+                pipeline_id=int(os.getenv("PARENT_PIPELINE_ID", 0)),
+                is_integration_test=enable_lightweight_mode,
+            )
 
         if parse_failed_job(logs=logs):
             n_attempts += 1
@@ -346,7 +455,14 @@ def main(
         if parse_finished_training(logs=logs):
             sys.exit(int(not success))  # invert for exit 0
         n_iteration += 1
-    sys.exit(1)
+
+    telemetrics_and_exit(
+        success=False,
+        test_case=test_case,
+        environment=environment,
+        pipeline_id=int(os.getenv("PARENT_PIPELINE_ID", 0)),
+        is_integration_test=enable_lightweight_mode,
+    )
 
 
 if __name__ == "__main__":

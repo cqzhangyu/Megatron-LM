@@ -25,6 +25,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
+from megatron.training import inprocess_restart
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
@@ -42,6 +43,8 @@ def initialize_megatron(
     skip_mpu_initialization=False,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
+    parsed_args=None,
+    store=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -56,7 +59,10 @@ def initialize_megatron(
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
     # Parse arguments
-    args = parse_args(extra_args_provider, ignore_unknown_args)
+    if parsed_args is None:
+        args = parse_args(extra_args_provider, ignore_unknown_args)
+    else:
+        args = parsed_args
 
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
@@ -112,7 +118,7 @@ def initialize_megatron(
     def finish_mpu_init():
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks)
+        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
 
         # Random seeds for reproducibility.
         if args.rank == 0:
@@ -124,6 +130,12 @@ def initialize_megatron(
             args.inference_rng_tracker,
             use_cudagraphable_rng=args.enable_cuda_graph,
         )
+
+        # Setup MoE aux loss scale value.
+        if args.num_experts is not None:
+            from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+
+            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
 
     if skip_mpu_initialization:
         return None
@@ -282,7 +294,7 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
+def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -308,15 +320,21 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
         else:
             device_id = None
 
+        # Set to non-default stream for cudagraph capturing.
+        if args.external_cuda_graph:
+            torch.cuda.set_stream(torch.cuda.Stream())
+
         # Call the init process
         init_process_group_kwargs = {
             'backend': args.distributed_backend,
+            'store': store,
             'world_size': args.world_size,
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
+        inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -330,6 +348,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
+                use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 expert_model_parallel_size=args.expert_model_parallel_size,

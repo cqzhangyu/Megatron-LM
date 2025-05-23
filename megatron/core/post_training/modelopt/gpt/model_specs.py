@@ -9,6 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.post_training.modelopt.layers import (
     BlockwiseFP8WeightTransformerLayer,
     FP8WeightTransformerLayer,
+    Linear,
     Norm,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -21,6 +22,7 @@ from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttentionSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -39,6 +41,7 @@ def get_gpt_layer_modelopt_spec(
     moe_grouped_gemm: bool = False,
     remap_te_layernorm: bool = False,
     qk_layernorm: bool = False,
+    qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Mix the native spec with TENorm.
 
@@ -66,6 +69,7 @@ def get_gpt_layer_modelopt_spec(
                 'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
                 'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
             }
+    norm = L2Norm if qk_l2_norm else (Norm if qk_layernorm else IdentityOp)
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -77,8 +81,8 @@ def get_gpt_layer_modelopt_spec(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=core_attention,
                     linear_proj=RowParallelLinear,
-                    q_layernorm=Norm if qk_layernorm else IdentityOp,
-                    k_layernorm=Norm if qk_layernorm else IdentityOp,
+                    q_layernorm=norm,
+                    k_layernorm=norm,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -96,6 +100,7 @@ def get_gpt_modelopt_spec(
     local_core_attention: bool = False,
     remap_te_layernorm: bool = False,
     real_quant_cfg: str = "None",
+    qk_l2_norm: bool = False,
 ):
     """Mix the native spec with TENorm.
 
@@ -103,6 +108,9 @@ def get_gpt_modelopt_spec(
     is using TENorm from Transformer-Engine. The issue is that FusedLayerNorm from apex
     has stopped supporting RMSNorm needed by llama.
     """
+    # Llama4 Scout-16E support for NeMo. NeMo's GPTConfig is using attribute .qk_l2_norm directly.
+    qk_l2_norm = getattr(config, "qk_l2_norm", qk_l2_norm)
+
     moe_sharded_state_dict_keys_map = {}
     dense_sharded_state_dict_keys_map = {}
     if remap_te_layernorm:
@@ -135,23 +143,24 @@ def get_gpt_modelopt_spec(
         attn_module = MLASelfAttention
         attn_submodules = MLASelfAttentionSubmodules(
             linear_q_proj=ColumnParallelLinear,
-            linear_q_down_proj=ColumnParallelLinear,
+            linear_q_down_proj=Linear,
             q_layernorm=Norm,
             linear_q_up_proj=ColumnParallelLinear,
-            linear_kv_down_proj=ColumnParallelLinear,
+            linear_kv_down_proj=Linear,
             kv_layernorm=Norm,
             linear_kv_up_proj=ColumnParallelLinear,
             core_attention=core_attention,
             linear_proj=RowParallelLinear,
         )
     else:
+        norm = L2Norm if qk_l2_norm else Norm if config.qk_layernorm else IdentityOp
         attn_module = SelfAttention
         attn_submodules = SelfAttentionSubmodules(
             linear_qkv=ColumnParallelLinear,
             core_attention=core_attention,
             linear_proj=RowParallelLinear,
-            q_layernorm=Norm if config.qk_layernorm else IdentityOp,
-            k_layernorm=Norm if config.qk_layernorm else IdentityOp,
+            q_layernorm=norm,
+            k_layernorm=norm,
         )
 
     dense_mlp_spec = get_mlp_module_spec(use_te=False)
