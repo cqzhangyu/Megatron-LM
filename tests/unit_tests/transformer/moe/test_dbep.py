@@ -78,6 +78,8 @@ class MoEModelTestContainer:
             moe_enable_deepep=kwargs.get("moe_enable_deepep", False),
             dbep_multiplier=dbep_multiplier,
             num_dbep_experts=num_dbep_experts,
+            dbep_alpha_local_gpu=0.13,
+            dbep_alpha_local_node=0.0,
         )
 
         ddp_config = DistributedDataParallelConfig(

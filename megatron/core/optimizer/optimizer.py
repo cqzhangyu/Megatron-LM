@@ -1092,6 +1092,9 @@ class ChainedOptimizer(MegatronOptimizer):
             grad_norm = get_grad_norm_fp32(
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
+            # grad_norm = get_grad_norm_fp32(
+            #     grads_for_norm, grad_stats_parallel_group=parallel_state.get_intra_distributed_optimizer_instance_group()
+            # )
         else:
             grad_norms = []
             for optimizer in self.chained_optimizers:

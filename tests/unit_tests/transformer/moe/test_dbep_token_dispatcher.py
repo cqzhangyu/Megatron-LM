@@ -78,6 +78,8 @@ class MoEModelTestContainer:
             moe_enable_deepep=kwargs.get("moe_enable_deepep", False),
             dbep_multiplier=dbep_multiplier,
             num_dbep_experts=num_dbep_experts,
+            dbep_alpha_local_gpu=0.13,
+            dbep_alpha_local_node=0.0,
         )
 
         ddp_config = DistributedDataParallelConfig(
@@ -142,20 +144,23 @@ class MoEModelTestContainer:
         routing_map = routing_map.cuda()
         probs = probs.cuda()
 
-        print("rank ", rank, "hidden_states", hidden_states[0, :, 0])
+        print(f"rank {rank}, hidden_states", hidden_states[0, :, 0])
 
-        (permuted_local_hidden_states, tokens_per_expert) = (
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
             token_dispatcher.token_permutation(hidden_states, probs, routing_map)
         )
 
-        print("rank ", rank, "permuted_local_hidden_states", permuted_local_hidden_states[:, 0])
+        print(f"rank {rank}, permuted_local_hidden_states", permuted_local_hidden_states[:, 0])
+        torch.cuda.current_stream().synchronize()
+
+        permuted_local_hidden_states = permuted_local_hidden_states / self.config.moe_router_topk
 
         restored_hidden_states, restored_bias = token_dispatcher.token_unpermutation(
             permuted_local_hidden_states
         )
 
         torch.cuda.current_stream().synchronize()
-        print("rank ", rank, "restored_hidden_states", restored_hidden_states[0, :, 0])
+        print(f"rank {rank}, restored_hidden_states", restored_hidden_states[0, :, 0])
 
         # reduce across TP rank equals to multiply data by a scale of ETP
         scale = self.config.expert_tensor_parallel_size
@@ -168,8 +173,8 @@ class MoEModelTestContainer:
         # check if the grad of the hidden states is same as the hidden states
         torch.autograd.backward(restored_hidden_states, hidden_states)
 
-        print("rank ", rank, "hidden_states.grad", hidden_states.grad[0, :, 0])
-        print("rank ", rank, "ans", ans[0, :, 0])
+        print(f"rank {rank}, hidden_states.grad", hidden_states.grad[0, :, 0])
+        print(f"rank {rank}, ans", ans[0, :, 0])
         assert torch.allclose(
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"

@@ -261,7 +261,7 @@ class IndicesToMultihot(torch.autograd.Function):
         return None, grad_probs_indices, None, None
 
 
-@experimental_fn(introduced_with_version='0.11.0rc0')
+# @experimental_fn(introduced_with_version='0.11.0rc0')
 def fused_indices_to_multihot(indices, probs_indices, num_of_local_experts):
     """Convert moe topk indices to multihot representation.
 

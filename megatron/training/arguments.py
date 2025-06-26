@@ -2821,6 +2821,9 @@ def _add_experimental_args(parser):
                        help='Path to save the expert distribution logs.')
     group.add_argument('--num-dbep-experts', type=int, default=0, help='Number of DBEP experts.')
     group.add_argument('--dbep-multiplier', type=int, default=None, help='DBEP multiplier.')
+    group.add_argument('--dbep-alpha-local-gpu', type=float, default=0, help='DBEP alpha for local gpu.')
+    group.add_argument('--dbep-alpha-local-node', type=float, default=0, help='DBEP aplha for local node.')
+    group.add_argument('--moe-capacity-factor-iter', type=int, default=None, help='Number of iterations to enforce moe capacity factor.')
     return parser
 
 

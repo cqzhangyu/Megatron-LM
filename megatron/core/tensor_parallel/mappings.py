@@ -512,7 +512,7 @@ def gather_from_sequence_parallel_region(
     """Wrapper for autograd function: forward: AG, backward: RS <first dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
     return _GatherFromSequenceParallelRegion.apply(
-        input_, tensor_parallel_output_grad, group, output_split_sizes, use_global_buffer, async_op, async_event
+        input_, group, tensor_parallel_output_grad, output_split_sizes, use_global_buffer, async_op, async_event
     )
 
 

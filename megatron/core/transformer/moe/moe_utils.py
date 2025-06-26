@@ -429,13 +429,6 @@ def sort_chunks_by_idxs(
         permuted_probs = None
     return output, permuted_probs
 
-def sort_chunks_by_idxs_custom(
-    input: torch.Tensor, split_sizes: list, sorted_idxs: list
-):
-    input = torch.split(input, split_sizes, dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
-    return output
-
 def group_limited_topk(
     scores: torch.Tensor,
     topk: int,
@@ -803,5 +796,6 @@ def get_default_model_comm_pgs():
     model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
     model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
     model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    print("model_comm_pgs.tp_ep", model_comm_pgs.tp_ep)
     model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     return model_comm_pgs

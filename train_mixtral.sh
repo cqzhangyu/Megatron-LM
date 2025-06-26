@@ -48,8 +48,7 @@ if [[ $MODEL_SIZE == "7B" ]]; then
 GPT_MODEL_ARGS=(
     --seq-length 4096
     --max-position-embeddings 32768
-    # --num-layers 32
-    --num-layers 8
+    --num-layers 32
     --num-attention-heads 32
     --hidden-size 4096
     --ffn-hidden-size 14336

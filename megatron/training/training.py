@@ -51,6 +51,7 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.cocktail import CocktailDataParallel
@@ -132,6 +133,20 @@ stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
+
+def dump_threads_stacks():
+    pid = os.getpid()
+    import traceback
+    # dump the stacktrace of all threads
+    print(f"Dumping stacktrace of all threads for pid {pid}")
+    with open(f'/workspace/userdata/logs/test/dbep/stacktrace-{pid}.log', 'w') as f:
+        for thread_id, stack in sys._current_frames().items():
+            f.write(f"Thread ID: {thread_id}\n")
+            for filename, lineno, name, line in traceback.extract_stack(stack):
+                f.write(f"  File: {filename}, line {lineno}, in {name}\n")
+                f.write(f"    {line.strip()}\n")
+            f.write("\n")
+            f.write("-" * 80 + "\n")
 
 def destroy_global_state():
     destroy_global_vars()
@@ -1044,7 +1059,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
         
     # Print the submodule names of all layers in the model.
-    if mpu.get_expert_model_parallel_rank() == 0:
+    if torch.distributed.get_rank() == 0:
         for model_module in model:
             # print(' > model layer names:', flush=True)
             # for name, module in model_module.named_modules():
@@ -1425,8 +1440,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     
-    import threading
-    threading.Timer(110, dump_threads_stacks).start()
+    # import threading
+    # threading.Timer(100, dump_threads_stacks).start()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
@@ -1671,7 +1686,7 @@ def training_log(
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
+            with open(f"{args.tensorboard_dir}/{args.memory_snapshot_path}", 'wb') as f:
                 dump(snapshot, f)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True)
@@ -2164,8 +2179,8 @@ def train(
                 repeat=1,
             ),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-            record_shapes=True,
-            with_stack=True,
+            # record_shapes=True,
+            # with_stack=True,
         )
         prof.start()
 
@@ -2203,7 +2218,7 @@ def train(
 
         # if on rank 0
         rank = torch.distributed.get_rank()
-        if rank == 0:
+        if rank == 0 and args.expert_dist_log_path:
             if iteration == 0:
                 # create new file
                 with open(args.expert_dist_log_path + f"_{rank}.txt", 'w') as f:
@@ -2254,6 +2269,20 @@ def train(
 
         # Run training step.
         args.curr_iteration = iteration
+        if args.moe_capacity_factor_iter is not None and iteration >= args.moe_capacity_factor_iter:
+            config.moe_expert_capacity_factor = None
+            # for model_chunk in model:
+            #     for name, module in model_module.named_modules():
+            #         if isinstance(module, MoELayer):
+            #             if module.token_dispatcher.config.moe_expert_capacity_factor is not None and rank == 0:
+            #                 print("token dispatcher config moe_expert_capacity_factor set to None")
+            #             else:
+            #                 print(
+            #                     f"token dispatcher config moe_expert_capacity_factor is already None"
+            #                 )
+            #                 break
+            #             module.token_dispatcher.config.moe_expert_capacity_factor = None
+            
         ft_integration.on_training_step_start()
         (
             loss_dict,

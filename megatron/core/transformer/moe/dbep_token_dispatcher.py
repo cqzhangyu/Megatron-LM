@@ -22,9 +22,9 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.fused_a2a import fused_combine, fused_dispatch
 from megatron.core.transformer.moe.moe_utils import (
+    ModelCommProcessGroups,
     permute,
     sort_chunks_by_idxs,
-    sort_chunks_by_idxs_custom,
     unpermute,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -52,7 +52,10 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts: int, config: TransformerConfig
+        self, 
+        num_local_experts: int, 
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
@@ -62,14 +65,14 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
             local_expert_indices (List[int]): Indices of local experts on the current device.
             config (TransformerConfig): Configuration for the transformer model.
         """
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
         self.num_local_experts = num_local_experts
         assert config.num_moe_experts is not None
         self.num_experts = config.num_moe_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
 
         assert not config.moe_pad_expert_input_to_capacity
-        assert self.config.moe_expert_capacity_factor is None
+        # assert self.config.moe_expert_capacity_factor is None
 
         self.num_dbep_experts = config.num_dbep_experts
         self.num_normal_experts = config.num_moe_experts - config.num_dbep_experts
@@ -81,6 +84,7 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         self.dbep_group = get_dbep_group()
         self.ep_rank = get_expert_model_parallel_rank()
         self.global_rank = torch.distributed.get_rank()
+        self.side_stream = torch.cuda.Stream()
         local_normal_expert_indices_offset = (
             self.ep_rank * self.num_local_normal_experts
         )
@@ -100,7 +104,6 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         # other TP ranks.
         self.output_splits_tp_normal = None
         self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else None
-        self.dbep_stream = torch.cuda.Stream()
 
         # used in permutation 2
         if self.num_normal_experts > 0:
@@ -153,7 +156,6 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
-        self.probs = probs
         self.routing_map = routing_map
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
@@ -175,12 +177,12 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
-        num_local_tokens_per_expert = routing_map.sum(dim=0).int()
+        num_local_tokens_per_expert = routing_map.sum(dim=0, dtype=torch.int)
 
         self.dbep_instance = get_dbep_instance_for_layer(self.layer_number)
     
         # Dropless
-        num_in_tokens = num_local_tokens_per_expert.sum().cpu()
+        num_in_tokens = routing_map.size(0) * self.config.moe_router_topk
 
         # self.time_0 = torch.cuda.Event(enable_timing=True)
         # self.time_1 = torch.cuda.Event(enable_timing=True)
@@ -243,20 +245,23 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         
         # torch.cuda.current_stream().synchronize()
         # Gather DBEP metadata
-        num_in_tokens_normal = 0 if self.num_normal_experts == 0 else self.input_splits_normal.sum()
-        self.num_out_tokens_normal = 0 if self.num_normal_experts == 0 else self.output_splits_normal.sum()
-        # self.time_2.record()
-        # print(f"rank {self.global_rank} num_in_tokens_normal {num_in_tokens_normal}")
-        # append num_out_tokens_normal to the end of num_local_tokens_per_expert_dbep
-    
-        num_local_tokens_per_expert_dbep = num_local_tokens_per_expert[self.num_normal_experts:]
         if self.num_local_normal_experts > 0:
+            num_in_tokens_normal = self.input_splits_normal.sum()
+            self.num_out_tokens_normal = self.output_splits_normal.sum()
+            num_local_tokens_per_expert_dbep = num_local_tokens_per_expert[self.num_normal_experts:]
             # num_local_tokens_per_expert_dbep = torch.zeros([(self.num_dbep_experts + 1)], dtype=torch.int)
             # num_local_tokens_per_expert_dbep[:self.num_dbep_experts] = num_local_tokens_per_expert[self.num_normal_experts:]
             # num_local_tokens_per_expert_dbep[-1] = self.num_out_tokens_normal
             # num_local_tokens_per_expert_dbep = num_local_tokens_per_expert_dbep.cuda()
             num_local_tokens_per_expert_dbep = torch.cat([num_local_tokens_per_expert_dbep, torch.tensor([self.num_out_tokens_normal], dtype=torch.int, device=torch.cuda.current_device())], dim=0)
-            
+        else:
+            num_in_tokens_normal = 0
+            self.num_out_tokens_normal = 0
+            # self.time_2.record()
+            # print(f"rank {self.global_rank} num_in_tokens_normal {num_in_tokens_normal}")
+            # append num_out_tokens_normal to the end of num_local_tokens_per_expert_dbep
+        
+            num_local_tokens_per_expert_dbep = num_local_tokens_per_expert
 
         # print(f"rank {self.global_rank} num_local_tokens_per_expert_dbep {num_local_tokens_per_expert_dbep}")
         
@@ -265,12 +270,26 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         # print(f"rank {self.global_rank} start DBEP all-gather {self.dbep_group}")
         num_global_tokens_per_expert_dbep = (
             gather_from_sequence_parallel_region(
-                num_local_tokens_per_expert_dbep, group=self.dbep_group, async_op=False, async_event=async_event_dbep
+                num_local_tokens_per_expert_dbep, group=self.dbep_group, async_op=True, async_event=async_event_dbep
             )
         )
         
-        num_global_tokens_per_expert_dbep = num_global_tokens_per_expert_dbep.reshape(self.dbep_size, -1).to(torch.device("cpu"))#, non_blocking=True)
-        # print(f"rank {self.global_rank} num_global_tokens_per_expert_dbep {num_global_tokens_per_expert_dbep}")
+        # if self.shared_experts is not None:
+        #     self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+
+        # Permutation 1: input to AlltoAll input
+        self.hidden_shape_before_permute = hidden_states.shape
+
+        # permute in side stream
+        with torch.cuda.stream(self.side_stream):
+            permutated_local_input_tokens, permuted_probs, self.reversed_local_input_permutation_mapping = permute(
+                hidden_states,
+                routing_map,
+                probs=probs,
+                num_out_tokens=num_in_tokens,
+                fused=self.config.moe_permute_fusion,
+                drop_and_pad=False,
+            )
 
         if self.num_local_normal_experts > 1:
             # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
@@ -285,19 +304,6 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
                     )
                 )
         
-        # if self.shared_experts is not None:
-        #     self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
-
-        # Permutation 1: input to AlltoAll input
-        self.hidden_shape_before_permute = hidden_states.shape
-        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
-            hidden_states,
-            routing_map,
-            num_out_tokens=num_in_tokens,
-            fused=self.config.moe_permute_fusion,
-            drop_and_pad=False,
-        )
-
         # print(f"rank {self.global_rank} permutated_local_input_tokens {permutated_local_input_tokens[:, 0]}")
 
         # normal all-to-all
@@ -307,9 +313,13 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens_normal = permutated_local_input_tokens[
                 :num_in_tokens_normal , :
             ]
+            permuted_probs_normal = permuted_probs[:num_in_tokens_normal]
 
             global_input_tokens_normal = all_to_all(
                 self.ep_group, permutated_local_input_tokens_normal, self.output_splits_normal, self.input_splits_normal, async_op=True, async_event=async_event_normal
+            )
+            global_probs_normal = all_to_all(
+                self.ep_group, permuted_probs_normal, self.output_splits_normal, self.input_splits_normal
             )
             # print(f"rank {self.global_rank} global_input_tokens_normal {global_input_tokens_normal[:, 0]}")
 
@@ -319,6 +329,9 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         # DBEP prepare
         if async_event_dbep[0] is not None:
             async_event_dbep[0].wait()
+        
+        num_global_tokens_per_expert_dbep = num_global_tokens_per_expert_dbep.reshape(self.dbep_size, -1).to(torch.device("cpu"))#, non_blocking=True)
+        # print(f"rank {self.global_rank} num_global_tokens_per_expert_dbep {num_global_tokens_per_expert_dbep}")
 
         # [num_dbep_experts]
         expert_load_dbep = (
@@ -335,16 +348,45 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
             gpu_load_normal = torch.zeros(self.dbep_size, dtype=torch.float64)
 
         # launch linear programming
-        self.expert_replicas = self.dbep_instance.get_expert_replicas()
+        expert_replicas = self.dbep_instance.get_expert_replicas()
         replica_expert_offsets = self.dbep_instance.get_replica_expert_offsets()
-        # print(f"rank {self.global_rank} expert_replicas {self.expert_replicas}")
+        # print(f"rank {self.global_rank} expert_replicas {expert_replicas}")
         # print(f"rank {self.global_rank} replica_expert_offsets {replica_expert_offsets}")
+        self.expert_replicas = torch.tensor(
+            expert_replicas, dtype=torch.int, device=self.permute_idx_device
+        )
+        replica_expert_offsets = torch.tensor(
+            replica_expert_offsets, dtype=torch.int, device=self.permute_idx_device
+        )
+
         # [dbep_size, num_dbep_replicas]
         num_global_tokens_per_replica = torch.zeros(
             (self.dbep_size, self.dbep_size * self.num_local_dbep_experts), dtype=torch.int
         )
 
         self.dbep_instance.get_optimal_load(expert_load_dbep, gpu_load_normal, num_global_tokens_per_expert_dbep, int(num_in_tokens), num_global_tokens_per_replica)
+        
+        # [dbep_size * num_local_dbep_experts]
+        self.num_local_tokens_per_replica = num_global_tokens_per_replica[self.dbep_rank, :].view(-1).to(device=self.permute_idx_device)
+        # split the local tokens into chunks to experts' replicas
+        # expert's replica offset -> # local tokens to replica
+        # [dbep_size * num_local_dbep_experts]
+        expert_replica_splits = self.num_local_tokens_per_replica[expert_replicas]
+
+        self.side_stream.synchronize()
+        if self.num_local_normal_experts > 0:
+            permutated_local_input_tokens_dbep = permutated_local_input_tokens[
+                num_in_tokens_normal: , :
+            ]
+            permuted_probs_dbep = permuted_probs[num_in_tokens_normal:]
+        else:
+            permutated_local_input_tokens_dbep = permutated_local_input_tokens
+            permuted_probs_dbep = permuted_probs
+
+        # Permutation 1 for DBEP
+        permutated_local_input_tokens_dbep, permuted_probs_dbep = sort_chunks_by_idxs(permutated_local_input_tokens_dbep, expert_replica_splits, replica_expert_offsets, probs=permuted_probs_dbep, fused=self.config.moe_permute_fusion)
+
+        # print(f"rank {self.global_rank} permutated_local_input_tokens_dbep {permutated_local_input_tokens_dbep[:, 0]}")
         
         # [dbep_size, num_local_dbep_experts]
         self.num_global_tokens_per_local_replica = (
@@ -357,7 +399,7 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         self.output_splits_dbep = (
             self.num_global_tokens_per_local_replica
             .sum(axis=1)
-            .to(torch.device("cpu"), non_blocking=True)
+            # .to(torch.device("cpu"), non_blocking=True)
             .numpy()
         )
         # print(f"rank {self.global_rank} output_splits_dbep {self.output_splits_dbep}")
@@ -370,29 +412,16 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
             .numpy()
         )
         # print(f"rank {self.global_rank} input_splits_dbep {self.input_splits_dbep}")
-
-        # [dbep_size * num_local_dbep_experts]
-        self.num_local_tokens_per_replica = num_global_tokens_per_replica[self.dbep_rank, :].view(-1)#.to(torch.device("cpu"), non_blocking=True)
-        # split the local tokens into chunks to experts' replicas
-        # expert's replica offset -> # local tokens to replica
-        # [dbep_size * num_local_dbep_experts]
-        expert_replica_splits = self.num_local_tokens_per_replica[self.expert_replicas].tolist()
-
-        permutated_local_input_tokens_dbep = permutated_local_input_tokens[
-            num_in_tokens_normal: , :
-        ]
-
-        # Permutation 1 for DBEP
-        sort_chunks_by_idxs_custom(permutated_local_input_tokens_dbep, expert_replica_splits, replica_expert_offsets)
-
-        # print(f"rank {self.global_rank} permutated_local_input_tokens_dbep {permutated_local_input_tokens_dbep[:, 0]}")
         
-        torch.cuda.current_stream().synchronize()
+        # torch.cuda.current_stream().synchronize()
 
         # DBEP all-to-all
         async_event_dbep = [None]
+        global_probs_dbep = all_to_all(
+            self.dbep_group, permuted_probs_dbep, self.output_splits_dbep, self.input_splits_dbep, async_op=False
+        )
         global_input_tokens_dbep = all_to_all(
-            self.dbep_group, permutated_local_input_tokens_dbep, self.output_splits_dbep, self.input_splits_dbep, async_op=True, async_event=async_event_dbep
+            self.dbep_group, permutated_local_input_tokens_dbep, self.output_splits_dbep, self.input_splits_dbep, async_op=False, async_event=async_event_dbep
         )
 
         # wait for normal alltoall to complete
@@ -410,10 +439,11 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
 
         # Permutation 2: Sort tokens by local expert.
         if self.num_local_normal_experts > 1:
-            global_input_tokens_normal = sort_chunks_by_idxs(
+            global_input_tokens_normal, global_probs_normal = sort_chunks_by_idxs(
                 global_input_tokens_normal,
                 self.num_global_tokens_per_local_expert_normal.ravel(),
                 self.sort_input_by_local_experts_normal,
+                probs=global_probs_normal,
                 fused=self.config.moe_permute_fusion,
             )
 
@@ -421,19 +451,27 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         
         if async_event_dbep[0] is not None:
             async_event_dbep[0].wait()
+
+        if self.config.moe_permute_fusion:
+            split_sizes_dbep = self.num_global_tokens_per_local_replica.ravel().to(torch.device('cuda'))
+        else:
+            split_sizes_dbep = self.num_global_tokens_per_local_replica.ravel()
     
-        global_input_tokens_dbep = sort_chunks_by_idxs(
+        global_input_tokens_dbep, global_probs_dbep = sort_chunks_by_idxs(
             global_input_tokens_dbep,
-            self.num_global_tokens_per_local_replica.ravel(),
+            split_sizes_dbep,
             self.sort_input_by_local_experts_dbep,
+            probs=global_probs_dbep,
             fused=self.config.moe_permute_fusion,
         )
         # print(f"rank {self.global_rank} global_input_tokens_dbep {global_input_tokens_dbep[:, 0]}")
 
         if self.num_normal_experts > 0:
             global_input_tokens = torch.cat([global_input_tokens_normal, global_input_tokens_dbep], dim=0)
+            global_probs = torch.cat([global_probs_normal, global_probs_dbep], dim=0)
         else:
-            global_input_tokens = global_input_tokens_dbep
+            global_input_tokens = global_input_tokens_dbep.contiguous()
+            global_probs = global_probs_dbep.contiguous()
         
         # if self.ep_rank == 0 and self.tp_rank == 0 and self.training:
         #     # Calculate the number of tokens for each global expert.
@@ -467,14 +505,21 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
 
         if self.num_local_normal_experts > 0:
             # [tp_size, ep_size, num_local_experts] -> [num_local_experts]
-            num_tokens_per_local_expert_normal = num_global_tokens_per_local_expert_normal.sum(dim=(0, 1)).to(
-                torch.device("cpu")# , non_blocking=True
-            )
+            num_tokens_per_local_expert_normal = num_global_tokens_per_local_expert_normal.sum(dim=(0, 1))
             num_tokens_per_local_expert = torch.cat([num_tokens_per_local_expert_normal, num_tokens_per_local_replica], dim=0)
         else:
             num_tokens_per_local_expert = num_tokens_per_local_replica
 
-        return global_input_tokens, num_tokens_per_local_expert
+        # if self.dbep_rank == 0:
+        #     max_tokens_per_gpu = num_global_tokens_per_replica.reshape(self.dbep_size, self.dbep_size, self.num_local_dbep_experts).sum(axis=2).sum(axis=0).max().item()
+        #     torch.cuda.current_stream().synchronize()
+        #     print(f"max gpu load {max_tokens_per_gpu / num_in_tokens:.2f} for layer {self.layer_number}")
+        # torch.cuda.current_stream().synchronize()
+        # print(f"rank {self.global_rank} num_tokens_per_local_expert {num_tokens_per_local_expert}")
+        # print(f"rank {self.global_rank} global_input_tokens.shape {global_input_tokens.shape}")
+        # print(f"rank {self.global_rank} global_probs.shape {global_probs.shape}")
+
+        return global_input_tokens, num_tokens_per_local_expert, global_probs
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
@@ -501,13 +546,19 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
         hidden_states_normal = hidden_states[:self.num_out_tokens_normal, :]
         hidden_states_dbep = hidden_states[self.num_out_tokens_normal:, :]
 
+        if self.config.moe_permute_fusion:
+            split_sizes_dbep = self.num_global_tokens_per_local_replica.T.ravel().to(torch.device('cuda'))
+        else:
+            split_sizes_dbep = self.num_global_tokens_per_local_replica.T.ravel()
+
         # Unpermutation 2: DBEP
-        hidden_states_dbep = sort_chunks_by_idxs(
+        hidden_states_dbep, _ = sort_chunks_by_idxs(
             hidden_states_dbep,
-            self.num_global_tokens_per_local_replica.T.ravel(),
+            split_sizes_dbep,
             self.restore_output_by_local_experts_dbep,
             fused=self.config.moe_permute_fusion,
         )
+        
         # print(f"rank {self.global_rank} hidden_states_dbep {hidden_states_dbep[:, 0]}")
 
         # DBEP all-to-all
@@ -518,7 +569,7 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
 
         # Unpermute 2 normal
         if self.num_local_normal_experts > 1:
-            hidden_states_normal = sort_chunks_by_idxs(
+            hidden_states_normal, _ = sort_chunks_by_idxs(
                 hidden_states_normal,
                 self.num_global_tokens_per_local_expert_normal.T.ravel(),
                 self.restore_output_by_local_experts_normal,
@@ -544,8 +595,9 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
 
         if async_event_dbep[0] is not None:
             async_event_dbep[0].wait()
+
         # DBEP unpermutation 1
-        sort_chunks_by_idxs_custom(permutated_local_input_tokens_dbep, self.num_local_tokens_per_replica.tolist(), self.expert_replicas)
+        permutated_local_input_tokens_dbep, _ = sort_chunks_by_idxs(permutated_local_input_tokens_dbep, self.num_local_tokens_per_replica, self.expert_replicas, fused=self.config.moe_permute_fusion)
 
         if async_event_normal[0] is not None:
             async_event_normal[0].wait()
@@ -565,7 +617,6 @@ class MoEDBEPTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
-            probs=self.probs,
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=False,

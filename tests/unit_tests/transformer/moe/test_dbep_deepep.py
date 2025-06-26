@@ -42,7 +42,7 @@ class MoEModelTestContainer:
         num_dbep_experts=4,
         moe_router_topk=2,
         moe_router_load_balancing_type="aux_loss",
-        moe_token_dispatcher_type="alltoall",
+        moe_token_dispatcher_type="flex",
         moe_expert_capacity_factor=None,
         moe_pad_expert_input_to_capacity=False,
         moe_aux_loss_coeff=0.1,
@@ -65,7 +65,7 @@ class MoEModelTestContainer:
         self.micro_batch_size = 8
         self.std = 0.5
 
-        self.output_dir = output_dir
+        self.output_dir = None# output_dir
 
         self.config = TransformerConfig(
             tensor_model_parallel_size=tp_size,
@@ -93,11 +93,12 @@ class MoEModelTestContainer:
             sequence_parallel=tp_size > 1,
             add_bias_linear=False,
             moe_permute_fusion=True,
-            moe_enable_deepep=kwargs.get("moe_enable_deepep", False),
+            moe_enable_deepep=True,
             dbep_multiplier=dbep_multiplier,
             num_dbep_experts=num_dbep_experts,
             dbep_alpha_local_gpu=0.0,
             dbep_alpha_local_node=0.0,
+            dbep_ratio=1.0,
         )
 
         ddp_config = DistributedDataParallelConfig(
@@ -191,7 +192,7 @@ class MoEModelTestContainer:
         # torch.manual_seed(1000 + rank)
         # random.seed(1000 + rank)
         self.micro_batch_size = 1
-        self.sequence_length = 8
+        self.sequence_length = 16
         hidden_states = torch.zeros((self.micro_batch_size, self.sequence_length, self.config.hidden_size), dtype=torch.float32)
         # Permute and then unpermute data are supposed to restore original data
         routing_map = torch.zeros((self.micro_batch_size * self.sequence_length, self.num_moe_experts), dtype=torch.bool)
@@ -200,13 +201,15 @@ class MoEModelTestContainer:
             hidden_states[0, i, :] = torch.ones(
                 (self.config.hidden_size), dtype=torch.float32
             ) * (rank * 10 + expert)
-            if self.num_moe_experts - self.num_dbep_experts > 0:
-                routing_map[i, expert % (self.num_moe_experts - self.num_dbep_experts)] = True
-            else:
-                expert_2 = random.randint(1, self.num_moe_experts - 1)
-                routing_map[i, (expert_2 + expert) % self.num_moe_experts] = True
+            if self.config.moe_router_topk == 2:
+                if self.num_moe_experts - self.num_dbep_experts > 0:
+                    routing_map[i, expert % (self.num_moe_experts - self.num_dbep_experts)] = True
+                else:
+                    expert_2 = random.randint(1, self.num_moe_experts - 1)
+                    routing_map[i, (expert_2 + expert) % self.num_moe_experts] = True
             routing_map[i, expert % self.num_dbep_experts + self.num_moe_experts - self.num_dbep_experts] = True
-        probs = torch.ones((self.micro_batch_size * self.sequence_length, self.num_moe_experts), dtype=torch.float32) / self.config.moe_router_topk
+        probs = torch.zeros((self.micro_batch_size * self.sequence_length, self.num_moe_experts), dtype=torch.float32)
+        probs[routing_map] = 1.0 / self.config.moe_router_topk
         hidden_states = hidden_states.cuda()
         ans = hidden_states
         hidden_states.requires_grad = True
@@ -214,6 +217,7 @@ class MoEModelTestContainer:
         probs = probs.cuda()
 
         print(f"rank {rank} hidden_states {hidden_states[0, :, 0]}")
+        print(f"rank {rank} probs {probs}")
 
         (permuted_local_hidden_states, tokens_per_expert, _) = (
             token_dispatcher.token_permutation(hidden_states, probs, routing_map)
@@ -221,6 +225,7 @@ class MoEModelTestContainer:
 
         print(f"rank {rank} permuted_local_hidden_states {permuted_local_hidden_states[:, 0]}")
         permuted_local_hidden_states = permuted_local_hidden_states / self.config.moe_router_topk
+        torch.cuda.current_stream().synchronize()
 
         restored_hidden_states, restored_bias = token_dispatcher.token_unpermutation(
             permuted_local_hidden_states
@@ -347,11 +352,11 @@ class MoEModelTestContainer:
         print(f"rank {rank} DBEP dispatch time: {self.moe_layer.dispatch_time} ms")
         print(f"rank {rank} DBEP combine time: {self.moe_layer.combine_time} ms")
         print(f"rank {rank} DBEP expert computation time: {self.moe_layer.expert_computation_time} ms")
-        print(f"rank {rank} DBEP output_splits_dbep {self.token_dispatcher.output_splits_dbep}")
+        print(f"rank {rank} DBEP num_tokens_per_expert {self.token_dispatcher.num_tokens_per_expert}")
         # print(f"rank {rank} DBEP num_global_tokens_per_local_replica {self.token_dispatcher.num_global_tokens_per_local_replica}")
         
         time_buf[0] = forward_time + backward_time
-        time_buf[2] = self.token_dispatcher.output_splits_dbep.sum()
+        time_buf[2] = self.token_dispatcher.num_tokens_per_expert.sum()
 
         hidden_states_base.requires_grad = True
         start_time = torch.cuda.Event(enable_timing=True)
@@ -400,10 +405,10 @@ class MoEModelTestContainer:
         print(f"rank {rank} Base dispatch time: {self.moe_layer_base.dispatch_time} ms")
         print(f"rank {rank} Base combine time: {self.moe_layer_base.combine_time} ms")
         print(f"rank {rank} Base expert computation time: {self.moe_layer_base.expert_computation_time} ms")
-        print(f"rank {rank} Base output_splits {self.token_dispatcher_base.output_splits}")
+        print(f"rank {rank} Base num_tokens_per_expert {self.token_dispatcher_base.num_tokens_per_expert}")
 
         time_buf[1] = forward_time + backward_time
-        time_buf[3] = self.token_dispatcher_base.output_splits.sum()
+        time_buf[3] = self.token_dispatcher_base.num_tokens_per_expert.sum()
 
         output_time_bufs = [torch.zeros_like(time_buf).cuda() for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather(output_time_bufs, time_buf)
@@ -444,8 +449,13 @@ class MoEModelTestContainer:
                 optimizer.zero_grad()
                 dispatched_input, tokens_per_expert, _ = self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
                 restored_hidden_states, restored_bias = self.token_dispatcher.token_unpermutation(dispatched_input)
+                restored_hidden_states = restored_hidden_states / self.config.moe_router_topk
 
                 torch.autograd.backward(restored_hidden_states, hidden_states)
+
+                assert torch.allclose(
+                    restored_hidden_states, hidden_states
+                ), "Restored hidden states do not match original hidden states"
         self.moe_layer.training = True
 
         print(f"rank {rank} DBEP warmup done")
@@ -479,7 +489,7 @@ class MoEModelTestContainer:
         print(f"rank {rank} DBEP dispatch time: {time_0.elapsed_time(time_1)} ms")
         print(f"rank {rank} DBEP combine time: {time_1.elapsed_time(time_2)} ms")
         print(f"rank {rank} DBEP backward time: {time_2.elapsed_time(time_3)} ms")
-        print(f"rank {rank} DBEP output_splits_dbep {self.token_dispatcher.output_splits_dbep}")
+        print(f"rank {rank} DBEP num_tokens_per_expert {self.token_dispatcher.num_tokens_per_expert}")
         
         time_buf[0] = time_0.elapsed_time(time_3)
         print(f"rank {rank} DBEP total time: {time_buf[0]} ms")
@@ -572,7 +582,7 @@ class TestDBEPTokenDispatcher:
             num_dbep_experts=num_dbep_experts,
             moe_router_topk=moe_router_topk,
             moe_router_load_balancing_type="aux_loss",
-            moe_token_dispatcher_type="alltoall",
+            moe_token_dispatcher_type="flex",
             moe_permute_fusion=permute_fusion,
             moe_grouped_gemm=True,
             output_dir=output_dir,
@@ -639,7 +649,7 @@ if __name__ == "__main__":
             num_moe_experts=num_moe_experts,
             num_dbep_experts=num_dbep_experts,
             moe_router_topk=moe_router_topk,
-            permute_fusion=False,
+            permute_fusion=True,
             output_dir=output_dir,
         )
     except Exception as e:

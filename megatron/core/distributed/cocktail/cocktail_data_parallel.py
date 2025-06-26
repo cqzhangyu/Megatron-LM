@@ -110,12 +110,14 @@ class CocktailDataParallel(_BaseDataParallel):
             self.dbep_multiplier = config.dbep_multiplier
             self.dbep_size = self.expert_parallel_size * self.dbep_multiplier
             self.dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True, partial_data_parallel=True)
-            self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            self.pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             self.dbep_rank = parallel_state.get_dbep_rank()
             self.dbep_group_gloo = parallel_state.get_dbep_group_gloo()
             num_dbep_groups = data_parallel_world_size // self.dbep_size
             self.global_rank = torch.distributed.get_rank()
             self.dbep_group_id = parallel_state.get_dbep_group_id() % num_dbep_groups
+            self.dbep_alpha_local_gpu = config.dbep_alpha_local_gpu
+            self.dbep_alpha_local_node = config.dbep_alpha_local_node
             
             assert self.num_dbep_experts % self.expert_parallel_size == 0
             assert self.num_dbep_experts > 1 and self.num_dbep_experts <= self.num_global_experts
@@ -138,7 +140,7 @@ class CocktailDataParallel(_BaseDataParallel):
                     local_layers.append(layer_number)
 
             for layer_number in local_layers:
-                dbep_instance = ExpertLB(num_experts=self.num_dbep_experts, world_size=self.dbep_size, num_replicas_per_gpu=self.num_local_dbep_experts)
+                dbep_instance = ExpertLB(num_experts=self.num_dbep_experts, world_size=self.dbep_size, num_replicas_per_gpu=self.num_local_dbep_experts, rank=self.global_rank, num_gpu_per_node=8, alpha_local_gpu=self.dbep_alpha_local_gpu, alpha_local_node=self.dbep_alpha_local_node)
                 self.dbep_instances[layer_number] = dbep_instance
             parallel_state.set_dbep_instances(self.dbep_instances)
 
@@ -146,18 +148,20 @@ class CocktailDataParallel(_BaseDataParallel):
             # generate random expert placement for all gpus on gpu 0
             broadcast_buf = torch.zeros((self.num_layers, num_dbep_groups, self.num_dbep_experts + self.dbep_size * self.num_local_dbep_experts * 2), dtype=torch.int32)
             dbep_instance_0 = list(self.dbep_instances.values())[0]
+        
+            # print(f"rank {self.global_rank} num_layers {self.num_layers} local_layers {local_layers} num_dbep_groups {num_dbep_groups} dbep_group_id {self.dbep_group_id} dbep_size {self.dbep_size} num_local_dbep_experts {self.num_local_dbep_experts} num_local_experts {self.num_local_experts}")
             if self.global_rank == 0:
-                print("local_layers", local_layers, "num_dbep_groups", num_dbep_groups, "dbep_group_id", self.dbep_group_id, "dbep_size", self.dbep_size, "num_local_dbep_experts", self.num_local_dbep_experts, "num_local_experts", self.num_local_experts, flush=True)
                 for layer_id in range(self.num_layers):
                     for dbep_group_id in range(num_dbep_groups):
                         expert_num_replicas = broadcast_buf[layer_id, dbep_group_id, 0:self.num_dbep_experts].view(-1)
                         expert_replicas = broadcast_buf[layer_id, dbep_group_id, self.num_dbep_experts:self.num_dbep_experts + self.dbep_size * self.num_local_dbep_experts].view(-1)
                         replica_experts = broadcast_buf[layer_id, dbep_group_id, self.num_dbep_experts + self.dbep_size * self.num_local_dbep_experts:].view(-1)
                         
-                        dbep_instance_0.gen_random_expert_placement(expert_num_replicas, expert_replicas, replica_experts)
-                        # print(f"expert_num_replicas {expert_num_replicas}")
-                        # print(f"expert_replicas {expert_replicas}")
-                        # print(f"replica_experts {replica_experts}")
+                        # dbep_instance_0.gen_random_expert_placement(expert_num_replicas, expert_replicas, replica_experts)
+                        dbep_instance_0.gen_cayley_expert_placement(expert_num_replicas, expert_replicas, replica_experts)
+                        print(f"expert_num_replicas {expert_num_replicas}")
+                        print(f"expert_replicas {expert_replicas}")
+                        print(f"replica_experts {replica_experts}")
 
             # broadcast expert placement
             broadcast_buf = broadcast_buf.to(device=torch.cuda.current_device())
@@ -175,9 +179,14 @@ class CocktailDataParallel(_BaseDataParallel):
 
             dbep_expert_dp_ranks = {}
 
-            # create all dbep_dp_groups
+            local_expert_to_global = {}
             for layer_id in range(self.num_layers):
                 layer_number = layer_id + 1
+                # map local expert to global
+                local_expert_to_global[layer_number] = broadcast_buf[layer_id, self.dbep_group_id, self.num_dbep_experts + (self.dbep_size + self.dbep_rank) * self.num_local_dbep_experts:self.num_dbep_experts + (self.dbep_size + self.dbep_rank + 1) * self.num_local_dbep_experts].view(-1).tolist()
+                pp_rank = layer_id // ((self.num_layers + self.pp_size - 1) // self.pp_size)
+                
+                # create all dbep_dp_groups
                 for dbep_group_id in range(num_dbep_groups):
                     offset = self.num_dbep_experts
                     for expert in range(self.num_dbep_experts):
@@ -185,18 +194,13 @@ class CocktailDataParallel(_BaseDataParallel):
                         ranks = dbep_expert_dp_ranks.get((layer_number, expert), [])
                         for i in range(expert_num_replica):
                             replica = broadcast_buf[layer_id, dbep_group_id, offset + i].item()
-                            ranks.append(dbep_group_id * self.dbep_size + replica // self.num_local_dbep_experts)
+                            rank = pp_rank * data_parallel_world_size + dbep_group_id * self.dbep_size + replica // self.num_local_dbep_experts
+                            ranks.append(rank)
                         dbep_expert_dp_ranks[(layer_number, expert)] = ranks
                         offset += expert_num_replica
             
-            # map local expert to global
-            local_expert_to_global = {}
-            for layer_id in range(self.num_layers):
-                layer_number = layer_id + 1
-                local_expert_to_global[layer_number] = broadcast_buf[layer_id, self.dbep_group_id, self.num_dbep_experts + (self.dbep_size + self.dbep_rank) * self.num_local_dbep_experts:self.num_dbep_experts + (self.dbep_size + self.dbep_rank + 1) * self.num_local_dbep_experts].view(-1).tolist()
-            
             parallel_state.create_dbep_dp_groups(dbep_expert_dp_ranks)
-            # print("dbep_expert_dp_ranks:", dbep_expert_dp_ranks)
+            # print(f"rank {self.global_rank} dbep_expert_dp_ranks {dbep_expert_dp_ranks}")
             del broadcast_buf
 
         self.param_to_bucket_group = {}
@@ -604,7 +608,11 @@ class CocktailDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_expert_data_parallel_group()
+                dbep_ranks = getattr(param, 'dbep_ranks', None)
+                if dbep_ranks:
+                    data_parallel_group = parallel_state.get_dbep_dp_group_from_ranks(dbep_ranks)
+                else:
+                    data_parallel_group = parallel_state.get_expert_data_parallel_group()
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=True

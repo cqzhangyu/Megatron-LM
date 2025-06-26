@@ -251,6 +251,7 @@ def _get_param_groups_and_buffers(
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
         if hasattr(model_chunk, buffer_name):
             buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
+    # print(f"rank {torch.distributed.get_rank()} has {len(param_groups)} param groups: {[(len(g['params']), g['is_expert_parallel'], g['dbep_ranks']) for g in param_groups]}")
 
     return param_groups, buffers
 
@@ -426,7 +427,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 'grad_stats_parallel_group',
                 mpu.get_intra_distributed_optimizer_instance_group(),
             )
-            setattr(optimizer, 'grad_stats_parallel_group', data_parallel_group)
+            # setattr(optimizer, 'grad_stats_parallel_group', data_parallel_group)
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)

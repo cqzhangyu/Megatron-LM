@@ -69,6 +69,7 @@ class MoETokenDispatcher:
         self.tp_size = self.tp_group.size()
         self.tp_rank = self.tp_group.rank()
         self.ep_size = self.ep_group.size()
+        self.training = False
 
     @abstractmethod
     def token_permutation(
@@ -346,7 +347,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.shared_experts = None
         self.ep_rank = get_expert_model_parallel_rank()
         self.layer_number = None
-        self.expert_dist_log_path = config.expert_dist_log_path + f"_{torch.distributed.get_rank()}.txt"
+        self.expert_dist_log_path = None
+        if config.expert_dist_log_path:
+            self.expert_dist_log_path = config.expert_dist_log_path + f"_{torch.distributed.get_rank()}.txt"
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -446,12 +449,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # to get the `input_splits` and `output_splits` CPU values.
             self._maybe_update_cuda_sync_point("before_ep_alltoall")
             
-            if self.ep_rank == 0 and self.tp_rank == 0 and self.training:
+            # if self.ep_rank == 0:
+            #     max_gpu_load = num_global_tokens_per_expert.sum(axis=(0, 1)).reshape(self.ep_size, self.num_local_experts).sum(axis=1).max().item()
+            #     torch.cuda.current_stream().synchronize()
+            #     print(f"max gpu load {max_gpu_load / self.num_out_tokens:.2f} for layer {self.layer_number}")
+
+            if self.ep_rank == 0 and self.tp_rank == 0 and self.training and self.expert_dist_log_path:
                 # Calculate the number of tokens for each global expert.
                 # [num_experts]
-                num_global_tokens_per_global_expert = num_global_tokens_per_expert.sum(axis=(0, 1)).to(
-                    torch.device("cpu"), non_blocking=True
-                )
+                # num_global_tokens_per_global_expert = num_global_tokens_per_expert.sum(axis=(0, 1)).to(
+                #     torch.device("cpu"), non_blocking=True
+                # )
             #     # [num_experts]
             #     num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
             #         torch.device("cpu"), non_blocking=True
@@ -460,12 +468,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             #     # num_global_tokens_per_local_expert_cpu = num_global_tokens_per_local_expert.view(-1).contiguous().to(
             #     #     torch.device("cpu"), non_blocking=True
             #     # )
+                num_global_tokens_per_expert_cpu = num_global_tokens_per_expert.view(-1).cpu()
 
                 torch.cuda.current_stream().synchronize()
                 # Write expert distribution to a log file.
                 with open(self.expert_dist_log_path, "a") as f:
                     # [num_experts]
-                    f.write(f"Layer {self.layer_number} num_global_tokens_per_global_expert : {num_global_tokens_per_global_expert.tolist()}\n")
+                    f.write(f"Layer {self.layer_number} num_global_tokens_per_expert : {num_global_tokens_per_expert_cpu.tolist()}\n")
+                    # # [num_experts]
+                    # f.write(f"Layer {self.layer_number} num_global_tokens_per_global_expert : {num_global_tokens_per_global_expert.tolist()}\n")
             #         # [num_experts]
             #         f.write(f"Layer {self.layer_number} num_local_tokens_per_expert : {num_local_tokens_per_expert_cpu.tolist()}\n")
             #         # [num_local_experts]
@@ -1040,12 +1051,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # Initialize metadata
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
+        self._comm_manager.capacity_factor = self.config.moe_expert_capacity_factor
         self._comm_manager.setup_metadata(routing_map, probs)
         hidden_states = self._comm_manager.dispatch(hidden_states)
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+
+        # for debug
+        self.num_tokens_per_expert = tokens_per_expert
 
         return global_input_tokens, tokens_per_expert, permuted_probs
 

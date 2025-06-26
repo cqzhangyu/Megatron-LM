@@ -1255,6 +1255,55 @@ def initialize_model_parallel(
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
             print(f"Expert data parallel group {ranks}")
     
+
+
+    if num_distributed_optimizer_instances > 1:
+        # Create groups for Partial DistOpt, one for intra-partial DP domain
+        # Another for inter-partial DP domain
+        hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
+            rank,
+            ranks,
+            [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
+            create_gloo_process_groups=create_gloo_process_groups,
+            pg_options=[
+                get_nccl_options('intra_ep_dp', nccl_comm_cfgs),
+                get_nccl_options('inter_ep_dp', nccl_comm_cfgs),
+            ],
+            timeout=timeout,
+            group_desc='EXPERT_DATA_PARALLEL_GROUP',
+        )
+        if rank in ranks:
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
+            _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
+    else:
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
+    ### End of expert related parallel groups initialization
+
+    # build the intra distributed optimizer instance group
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    assert (
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
+    ), 'Intra distributed optimizer instance group is already initialized'
+
+    model_parallel_group_id = 0
+    intra_dist_opt_ranks = []
+    for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
+        model_parallel_group_id += 1
+        intra_dist_opt_ranks.extend(ranks)
+        if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
+            intra_dist_opt_instance_group = create_group(
+                intra_dist_opt_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('intra_dist_opt_instance', nccl_comm_cfgs),
+                group_desc='INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP',
+            )
+            if rank in intra_dist_opt_ranks:
+                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+                print(f"Intra distributed optimizer instance group {intra_dist_opt_ranks}")
+            intra_dist_opt_ranks = []
+    
     if dbep_multiplier is not None:
         assert dbep_multiplier > 1
         dbep_size = expert_model_parallel_size * dbep_multiplier
@@ -1299,53 +1348,6 @@ def initialize_model_parallel(
                 _DBEP_GROUP_ID = group_id
                 print(f"DBEP group {ranks}")
             group_id += 1
-
-
-        if num_distributed_optimizer_instances > 1:
-            # Create groups for Partial DistOpt, one for intra-partial DP domain
-            # Another for inter-partial DP domain
-            hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
-                rank,
-                ranks,
-                [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
-                create_gloo_process_groups=create_gloo_process_groups,
-                pg_options=[
-                    get_nccl_options('intra_ep_dp', nccl_comm_cfgs),
-                    get_nccl_options('inter_ep_dp', nccl_comm_cfgs),
-                ],
-                timeout=timeout,
-                group_desc='EXPERT_DATA_PARALLEL_GROUP',
-            )
-            if rank in ranks:
-                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
-                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
-                _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
-        else:
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
-    ### End of expert related parallel groups initialization
-
-    # build the intra distributed optimizer instance group
-    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
-    assert (
-        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
-    ), 'Intra distributed optimizer instance group is already initialized'
-
-    model_parallel_group_id = 0
-    intra_dist_opt_ranks = []
-    for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
-        model_parallel_group_id += 1
-        intra_dist_opt_ranks.extend(ranks)
-        if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
-            intra_dist_opt_instance_group = create_group(
-                intra_dist_opt_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options('intra_dist_opt_instance', nccl_comm_cfgs),
-                group_desc='INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP',
-            )
-            if rank in intra_dist_opt_ranks:
-                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
-            intra_dist_opt_ranks = []
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -2363,15 +2365,14 @@ def create_dbep_dp_groups(dbep_expert_dp_ranks: dict):
     _DBEP_DP_GROUPS = {}
     num_groups = 0
     for (layer, expert), ranks in sorted(dbep_expert_dp_ranks.items(), key=lambda x: x[0]):
-        global_ranks = [_DATA_PARALLEL_GLOBAL_RANKS[rank] for rank in ranks]
         # sort and make unique ranks
-        ranks_tuple = tuple(sorted(list(set(global_ranks))))
+        ranks_tuple = tuple(sorted(list(set(ranks))))
         dbep_expert_dp_ranks[(layer, expert)] = ranks_tuple
         group = _DBEP_ALL_GROUPS.get(ranks_tuple, None)
         if group is None:
-            print(f"rank {torch.distributed.get_rank()} creating DBEP DP group {num_groups} for ranks {ranks_tuple}")
+            # print(f"rank {torch.distributed.get_rank()} creating DBEP DP group {num_groups} for ranks {ranks_tuple}")
             group = create_group(
-                global_ranks,
+                ranks,
                 timeout=_DBEP_TIMEOUT,
                 pg_options=get_nccl_options('dbep-dp', _DBEP_NCCL_CONFIGS),
                 group_desc=f'DBEP_DP_GROUP_{num_groups}',
@@ -2383,5 +2384,3 @@ def create_dbep_dp_groups(dbep_expert_dp_ranks: dict):
 def get_dbep_dp_group_from_ranks(ranks : tuple):
     global _DBEP_ALL_GROUPS
     return _DBEP_ALL_GROUPS.get(ranks, None)
-    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
-    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None

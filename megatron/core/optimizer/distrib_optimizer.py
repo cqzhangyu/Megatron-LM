@@ -2131,6 +2131,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
             if not self.ddp_config.overlap_param_gather:
+                # CQ: Here is a bug in megatron. If there are multiple 
+                # DistributedOptimizer instances, each one has a entire
+                # model chunk. Consequently, each model_chunk's start_param_sync
+                # is called multiple times.
                 for model_chunk in self.model_chunks:
                     model_chunk.start_param_sync()
         if timers is not None:

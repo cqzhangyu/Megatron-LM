@@ -579,6 +579,15 @@ class TransformerConfig(ModelParallelConfig):
     dbep_multiplier: Optional[int] = None
     """ DBEP size / expert parallel size. """
 
+    dbep_alpha_local_gpu: float = 0.0
+    """ Alpha value for local GPU in DBEP. This is only used when using DBEP. """
+
+    dbep_alpha_local_node: float = 0.0
+    """ Alpha value for local node in DBEP. This is only used when using DBEP. """
+
+    dbep_ratio: float = 1.0
+    """ Ratio of DBEP tokens to total tokens. This is only used when using DBEP """
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

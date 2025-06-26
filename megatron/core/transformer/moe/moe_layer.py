@@ -21,6 +21,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.dbep_token_dispatcher import MoEDBEPTokenDispatcher
+from megatron.core.transformer.moe.dbep_deepep_token_dispatcher import MoEDBEPDeepEPTokenDispatcher
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -107,7 +108,6 @@ class MoELayer(BaseMoELayer):
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         self.submodules = submodules
-        super(MoELayer, self).__init__(config=config, layer_number=layer_number)
         self.use_dbep = not (config.dbep_multiplier is None)
         self.dispatch_time = None
         self.combine_time = None
@@ -129,9 +129,22 @@ class MoELayer(BaseMoELayer):
 
         # Initialize token dispatcher
         if self.use_dbep:
-            self.token_dispatcher = MoEDBEPTokenDispatcher(
-                self.num_local_experts, config=self.config
-            )
+            if config.moe_token_dispatcher_type == "alltoall":
+                self.token_dispatcher = MoEDBEPTokenDispatcher(
+                    self.num_local_experts,
+                    config=self.config,
+                    model_comm_pgs=model_comm_pgs,
+                )
+            elif config.moe_token_dispatcher_type == "flex":
+                self.token_dispatcher = MoEDBEPDeepEPTokenDispatcher(
+                    self.num_local_experts,
+                    config=self.config,
+                    model_comm_pgs=model_comm_pgs,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported token dispatcher type for DBEP: {config.moe_token_dispatcher_type}"
+                )
         elif config.moe_token_dispatcher_type == "allgather":
             self.token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.num_local_experts,

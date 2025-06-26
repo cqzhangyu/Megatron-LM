@@ -214,6 +214,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
         # Coalesce communication kernels across buckets in the bucket group.
+        # print(f"rank {torch.distributed.get_rank()} start param sync in group {torch.distributed.get_process_group_ranks(self.intra_distributed_optimizer_instance_group)} async_op={async_op}")
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
         ) as cm:
@@ -236,6 +237,8 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.param_gather_handle = None
+        # torch.cuda.synchronize()
+        # print(f"rank {torch.distributed.get_rank()} finish param sync in group {torch.distributed.get_process_group_ranks(self.intra_distributed_optimizer_instance_group)}")
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -337,7 +340,7 @@ class _ParamAndGradBucketGroup:
             communication_group = self.intra_distributed_optimizer_instance_group
         else:
             communication_group = self.data_parallel_group
-        print(f"rank {torch.distributed.get_rank()} start param sync in group {torch.distributed.get_process_group_ranks(communication_group)}")
+        # print(f"rank {torch.distributed.get_rank()} start grad sync in group {torch.distributed.get_process_group_ranks(communication_group)}")
 
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
@@ -390,8 +393,8 @@ class _ParamAndGradBucketGroup:
             # maintain consistency with prior code, we need to manually set communication handle to
             # None.
             self.grad_reduce_handle = None
-            
-        print(f"rank {torch.distributed.get_rank()} finish param sync in group {torch.distributed.get_process_group_ranks(communication_group)}")
+        
+        # print(f"rank {torch.distributed.get_rank()} finish grad sync in group {torch.distributed.get_process_group_ranks(communication_group)}")
 
     def finish_grad_sync(self):
         """
